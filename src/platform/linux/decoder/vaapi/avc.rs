@@ -22,7 +22,7 @@ use openuuyc_h264::syntax::{
     transform::{select_scaling_list_4x4, select_scaling_list_8x8},
 };
 
-use super::display::{self, Pool};
+use super::display::Pool;
 use super::output;
 use super::ref_list::{RplmOp, init_ref_pic_list_p, init_ref_pic_lists_b, modify_ref_pic_list};
 use crate::media::decode_api::DecodeError;
@@ -396,13 +396,7 @@ impl Avc {
         if !self.refs.is_empty() {
             return Err(DecodeError::NeedKeyframe);
         }
-        if !display::supports(profile, width, height) {
-            return Err(DecodeError::Unsupported);
-        }
-        // One extra surface for the picture being decoded right now, plus
-        // headroom for the pictures the renderer still holds as dmabufs. The
-        // decoder runs ahead of presentation, so without that headroom it would
-        // run out of free surfaces while the GPU still reads them.
+        // 为正在解码的图像预留一个表面，并给渲染器仍在使用的 dmabuf 预留空间。
         let extra = if crate::platform::linux::dmabuf::enabled() {
             DMABUF_SURFACE_HEADROOM
         } else {

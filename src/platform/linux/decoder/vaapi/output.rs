@@ -50,8 +50,7 @@ fn pack_planes(bytes: &[u8], info: &VAImage, rect: VisibleRect) -> Result<Vec<u8
         .and_then(|n| luma_bytes.checked_add(n))
         .ok_or(invalid.clone())?;
 
-    // Validate both planes before allocating or copying. Chroma rows are
-    // rounded to complete UV pairs, independently of an odd visible width.
+    // 分配和复制前先校验两个平面。色度行按完整 UV 对取整，也适用于奇数宽度。
     let region = |plane: usize, first_row: usize, rows: usize, row_width: usize| {
         let pitch = info.pitches[plane] as usize;
         if pitch < x.checked_add(row_width).ok_or(invalid.clone())? {
@@ -74,16 +73,20 @@ fn pack_planes(bytes: &[u8], info: &VAImage, rect: VisibleRect) -> Result<Vec<u8
     };
     let (luma_start, luma_pitch) = region(0, y, height, width)?;
     let (chroma_start, chroma_pitch) = region(1, y / 2, chroma_height, chroma_width)?;
-    let mut packed = vec![0; total];
-    for row in 0..height {
-        let source = luma_start + row * luma_pitch;
-        packed[row * width..(row + 1) * width].copy_from_slice(&bytes[source..source + width]);
-    }
-    for row in 0..chroma_height {
-        let source = chroma_start + row * chroma_pitch;
-        let target = luma_bytes + row * chroma_width;
-        packed[target..target + chroma_width]
-            .copy_from_slice(&bytes[source..source + chroma_width]);
+    // 每个字节都来自解码表面，直接追加，避免先把整帧缓冲区清零。
+    let mut packed = Vec::with_capacity(total);
+    for (start, pitch, row_width, rows) in [
+        (luma_start, luma_pitch, width, height),
+        (chroma_start, chroma_pitch, chroma_width, chroma_height),
+    ] {
+        if pitch == row_width {
+            packed.extend_from_slice(&bytes[start..start + rows * row_width]);
+        } else {
+            for row in 0..rows {
+                let source = start + row * pitch;
+                packed.extend_from_slice(&bytes[source..source + row_width]);
+            }
+        }
     }
     Ok(packed)
 }

@@ -79,13 +79,13 @@ pub(crate) struct DualCapability {
     pub local_display_info: Vec<DisplayCapability>,
     pub frame_quality_capability: Vec<FrameQualityCapability>,
     #[serde(skip)]
-    preferred_hardware: Vec<FrameQualityCapability>,
+    preferred_hardware: [Vec<FrameQualityCapability>; 2],
 }
 
 impl DualCapability {
     pub(crate) fn negotiate(local: &DeviceCapability, remote: DeviceCapability) -> Self {
         let mut rows = Vec::with_capacity(8);
-        let mut preferred_hardware = Vec::new();
+        let mut preferred_hardware = [Vec::new(), Vec::new()];
         for video_codec in [1, 2, AV1_CODEC_ID] {
             if video_codec == AV1_CODEC_ID
                 && (!local
@@ -131,9 +131,7 @@ impl DualCapability {
                     } else {
                         QUALITY_DIMENSIONS[1]
                     };
-                    // Implementation 5 is the software encoder and 37 the
-                    // software decoder. Keep this local preference out of UU's
-                    // serialized capability contract.
+                    // 实现 5 和 37 分别表示软件编码和软件解码。硬件优先级只用于本地选流。
                     let native_maximum = |caps: &[CodecCapability]| {
                         caps.iter()
                             .filter(|cap| {
@@ -144,24 +142,28 @@ impl DualCapability {
                             .map(|cap| (cap.width, cap.height))
                             .max()
                     };
-                    if let (Some(a), Some(b)) = (
-                        native_maximum(&local.video_codec_capability),
-                        native_maximum(&remote.video_codec_capability),
-                    ) {
-                        if let Some(tier) = QUALITY_DIMENSIONS
-                            .iter()
-                            .rposition(|size| *size <= a.min(b))
+                    if let Some(decoder) = native_maximum(&local.video_codec_capability) {
+                        // 先匹配双方硬件能力，再允许对端软编码、本机硬解码。
+                        for (rows, encoder) in preferred_hardware
+                            .iter_mut()
+                            .zip([native_maximum(&remote.video_codec_capability), encoder])
                         {
-                            let (max_width, max_height) = QUALITY_DIMENSIONS[tier];
-                            preferred_hardware.push(FrameQualityCapability {
-                                video_codec,
-                                chroma_sampling,
-                                bit_depth,
-                                max_width,
-                                max_height,
-                                max_frame_quality: tier as i32 + 1,
-                                result: 0,
-                            });
+                            if let Some(tier) = encoder.and_then(|encoder| {
+                                QUALITY_DIMENSIONS
+                                    .iter()
+                                    .rposition(|size| *size <= encoder.min(decoder))
+                            }) {
+                                let (max_width, max_height) = QUALITY_DIMENSIONS[tier];
+                                rows.push(FrameQualityCapability {
+                                    video_codec,
+                                    chroma_sampling,
+                                    bit_depth,
+                                    max_width,
+                                    max_height,
+                                    max_frame_quality: tier as i32 + 1,
+                                    result: 0,
+                                });
+                            }
                         }
                     }
                     rows.push(FrameQualityCapability {
@@ -212,17 +214,19 @@ impl DualCapability {
         let av1 = self.exact(AV1_CODEC_ID, chroma, hdr);
         let mut order = [AV1_CODEC_ID, 2, 1];
         order.sort_by_key(|codec| Some(*codec) != self.preferred_codec);
-        for codec in order {
-            if let Some(row) = self.preferred_hardware.iter().copied().find(|r| {
-                r.video_codec == codec
-                    && r.chroma_sampling == chroma
-                    && (r.bit_depth >= 10) == hdr
-                    && r.max_frame_quality >= minimum
-                    && self
-                        .exact(codec, chroma, hdr)
-                        .is_some_and(|current| current.valid())
-            }) {
-                return row;
+        for hardware in &self.preferred_hardware {
+            for codec in order {
+                if let Some(row) = hardware.iter().copied().find(|r| {
+                    r.video_codec == codec
+                        && r.chroma_sampling == chroma
+                        && (r.bit_depth >= 10) == hdr
+                        && r.max_frame_quality >= minimum
+                        && self
+                            .exact(codec, chroma, hdr)
+                            .is_some_and(|current| current.valid())
+                }) {
+                    return row;
+                }
             }
         }
         for row in order
@@ -262,5 +266,37 @@ impl DualCapability {
                 max_frame_quality: 0,
                 result: -3,
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefers_local_hardware_with_a_software_encoder() {
+        let capability = |video_codec, codec_impl, quality: usize| {
+            let (width, height) = QUALITY_DIMENSIONS[quality - 1];
+            CodecCapability {
+                video_codec,
+                width,
+                height,
+                chroma_sampling: 1,
+                bit_depth: 8,
+                codec_impl,
+            }
+        };
+        let local = DeviceCapability {
+            video_codec_capability: vec![capability(1, 32, 2), capability(AV1_CODEC_ID, 37, 3)],
+            ..Default::default()
+        };
+        let remote = DeviceCapability {
+            video_codec_capability: vec![capability(1, 5, 2), capability(AV1_CODEC_ID, 5, 3)],
+            ..Default::default()
+        };
+
+        let dual = DualCapability::negotiate(&local, remote);
+        assert_eq!(dual.select(1, false, 2).video_codec, 1);
+        assert_eq!(dual.select(1, false, 3).video_codec, AV1_CODEC_ID);
     }
 }

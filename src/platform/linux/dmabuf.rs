@@ -59,23 +59,31 @@ impl DmabufFrame {
     }
 }
 
-/// Keeps a decoded surface out of the decoder pool until the last clone drops.
-#[derive(Clone, Debug)]
-pub(crate) struct SurfaceLease {
-    returned: Arc<Mutex<Vec<usize>>>,
+/// 直到最后一个引用释放后，才将解码表面归还给解码器。
+#[derive(Debug)]
+pub(crate) struct SurfaceLease(Arc<LeaseInner>);
+
+impl Clone for SurfaceLease {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+#[derive(Debug)]
+struct LeaseInner {
+    returned: ReturnedSurfaces,
     index: usize,
 }
 
 impl SurfaceLease {
-    pub(crate) fn new(returned: Arc<Mutex<Vec<usize>>>, index: usize) -> Self {
-        Self { returned, index }
+    pub(crate) fn new(returned: ReturnedSurfaces, index: usize) -> Self {
+        Self(Arc::new(LeaseInner { returned, index }))
     }
 }
 
-impl Drop for SurfaceLease {
+impl Drop for LeaseInner {
     fn drop(&mut self) {
-        // A poisoned lock only means some other thread panicked; the surface is
-        // still ours to hand back, so ignore the poison.
+        // 即使其他线程持锁时发生 panic，也要归还这个表面。
         let mut returned = match self.returned.lock() {
             Ok(returned) => returned,
             Err(poisoned) => poisoned.into_inner(),
@@ -114,4 +122,24 @@ pub(crate) fn enabled() -> bool {
         std::env::var("OPENUUYC_ZEROCOPY").as_deref(),
         Ok("1") | Ok("true") | Ok("yes")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn returns_surface_only_after_the_last_lease_is_dropped() {
+        let returned = ReturnedSurfaces::default();
+        let frame = SurfaceLease::new(Arc::clone(&returned), 7);
+        let renderer = frame.clone();
+        let submission = renderer.clone();
+
+        drop(frame);
+        drop(renderer);
+        assert!(returned.lock().unwrap().is_empty());
+
+        drop(submission);
+        assert_eq!(*returned.lock().unwrap(), vec![7]);
+    }
 }

@@ -6,11 +6,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 mod settings;
 
-// Repository identity survives the OpenUUYC -> Farwing rename. Name-based API
-// URLs return 301, while this client deliberately does not follow redirects.
-const LATEST_RELEASE: &str = "https://api.github.com/repositories/1364197594/releases/latest";
-const RELEASE_LIST: &str = "https://api.github.com/repositories/1364197594/releases";
-const RELEASES: &str = "https://github.com/djkcyl/farwing/releases";
+const LATEST_RELEASE: &str = "https://api.github.com/repos/moaeiou/openuuyc/releases/latest";
+const RELEASE_LIST: &str = "https://api.github.com/repos/moaeiou/openuuyc/releases";
+const RELEASES: &str = "https://github.com/moaeiou/openuuyc/releases";
 const RETRY_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]

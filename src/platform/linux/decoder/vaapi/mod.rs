@@ -109,5 +109,5 @@ pub(super) fn probe(codec: VideoCodec, width: u32, height: u32, depth: u8, chrom
     };
     profiles
         .iter()
-        .any(|profile| display::supports(*profile, width, height))
+        .any(|profile| display::decode_display(*profile, width, height).is_ok())
 }

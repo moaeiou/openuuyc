@@ -211,14 +211,9 @@ impl VideoLayer {
         self.frame.is_some()
     }
 
-    /// Whether the current picture aliases a decoder surface.
-    ///
-    /// The caller must not let that surface return to the decoder pool until
-    /// the GPU is done sampling it, so it waits for the submission to complete.
-    pub(crate) fn holds_dmabuf(&self) -> bool {
-        self.frame
-            .as_ref()
-            .is_some_and(|frame| frame.lease.is_some())
+    /// 为引用当前解码表面的 GPU 提交保留一份租约。
+    pub(crate) fn dmabuf_lease(&self) -> Option<crate::platform::linux::dmabuf::SurfaceLease> {
+        self.frame.as_ref().and_then(|frame| frame.lease.clone())
     }
 
     pub(crate) fn clear(&mut self) {

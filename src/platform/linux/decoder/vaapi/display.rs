@@ -1,8 +1,5 @@
-//! VA-API display, decode session and surface pool.
-//!
-//! One display per render node, opened once and shared: `vaInitialize` talks to
-//! the driver and is far too expensive to repeat per session.
-use std::cell::RefCell;
+//! VA-API 解码设备、会话和表面池。
+use std::cell::{OnceCell, RefCell};
 use std::rc::Rc;
 
 use cros_libva::{
@@ -12,22 +9,13 @@ use cros_libva::{
 
 use crate::media::decode_api::DecodeError;
 
-/// NV12 (8-bit 4:2:0) is the only layout this backend reads back today.
+/// 解码回读使用 NV12（8 位 4:2:0）。
 const RT_FORMAT_YUV420: u32 = cros_libva::VA_RT_FORMAT_YUV420;
 
-/// Open the first render node whose driver can decode, and keep it.
-pub(super) fn display() -> Result<Rc<Display>, DecodeError> {
-    thread_local! {
-        static DISPLAY: RefCell<Option<Rc<Display>>> = const { RefCell::new(None) };
-    }
-    DISPLAY.with(|cell| {
-        if let Some(display) = cell.borrow().as_ref() {
-            return Ok(Rc::clone(display));
-        }
-        let display = open_display()?;
-        *cell.borrow_mut() = Some(Rc::clone(&display));
-        Ok(display)
-    })
+thread_local! {
+    // VA-API 设备只在工作线程内共享，避免为每个待探测的尺寸重复初始化驱动。
+    static DECODE_DISPLAYS: OnceCell<Vec<(Rc<Display>, Vec<VAProfile::Type>)>> =
+        const { OnceCell::new() };
 }
 
 /// Open and keep the first render node that supports H.264 encoding.
@@ -63,29 +51,51 @@ pub(super) fn encoder_display(
     })
 }
 
-fn open_display() -> Result<Rc<Display>, DecodeError> {
+fn open_decode_displays() -> Vec<(Rc<Display>, Vec<VAProfile::Type>)> {
     crate::platform::linux::cuda::initialize_before_va();
-    // `Display::open` walks the render nodes itself; the explicit loop is the
-    // fallback for systems where the first node is not the decoding one.
-    if let Some(display) = Display::open()
-        && !decode_profiles(&display).is_empty()
-    {
-        log_vendor(&display);
-        return Ok(display);
-    }
-    for index in 128..136u32 {
-        let path = format!("/dev/dri/renderD{index}");
-        let Some(display) = open_render_node(&path) else {
-            continue;
-        };
-        if decode_profiles(&display).is_empty() {
-            continue;
-        }
-        tracing::debug!(path, "VA-API display opened");
-        log_vendor(&display);
-        return Ok(display);
-    }
-    Err(DecodeError::Unsupported)
+    let mut nodes: Vec<_> = std::fs::read_dir("/dev/dri")
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix("renderD"))
+                .is_some_and(|index| index.parse::<u32>().is_ok())
+        })
+        .collect();
+    nodes.sort_unstable();
+    nodes
+        .iter()
+        .filter_map(|path| {
+            let path = path.to_str()?;
+            let display = open_render_node(path)?;
+            let profiles = decode_profiles(&display);
+            if profiles.is_empty() {
+                return None;
+            }
+            tracing::debug!(path, "VA-API 解码设备已打开");
+            log_vendor(&display);
+            Some((display, profiles))
+        })
+        .collect()
+}
+
+pub(super) fn decode_display(
+    profile: VAProfile::Type,
+    width: u32,
+    height: u32,
+) -> Result<Rc<Display>, DecodeError> {
+    DECODE_DISPLAYS.with(|cell| {
+        cell.get_or_init(open_decode_displays)
+            .iter()
+            .find(|(display, profiles)| {
+                profiles.contains(&profile) && supports_size(display, profile, width, height)
+            })
+            .map(|(display, _)| Rc::clone(display))
+            .ok_or(DecodeError::Unsupported)
+    })
 }
 
 /// Opens one render node. libva before 2.15 cannot map the `nvidia-drm`
@@ -131,14 +141,8 @@ fn decode_profiles(display: &Rc<Display>) -> Vec<VAProfile::Type> {
         .collect()
 }
 
-/// Whether this driver can decode `profile` at `width` x `height`.
-pub(super) fn supports(profile: VAProfile::Type, width: u32, height: u32) -> bool {
-    let Ok(display) = display() else {
-        return false;
-    };
-    if !decode_profiles(&display).contains(&profile) {
-        return false;
-    }
+/// 检查驱动报告的像素格式和尺寸限制。
+fn supports_size(display: &Display, profile: VAProfile::Type, width: u32, height: u32) -> bool {
     let mut attributes = [
         attribute(VAConfigAttribType::VAConfigAttribRTFormat),
         attribute(VAConfigAttribType::VAConfigAttribMaxPictureWidth),
@@ -162,7 +166,7 @@ pub(super) fn supports(profile: VAProfile::Type, width: u32, height: u32) -> boo
     {
         return false;
     }
-    // A driver that does not report a limit accepts whatever it is given.
+    // 驱动未报告尺寸上限时，交由实际解码会话验证。
     let within = |kind: VAConfigAttribType::Type, wanted: u32| {
         value(kind).is_none_or(|limit| limit == 0 || limit >= wanted)
     };
@@ -170,10 +174,10 @@ pub(super) fn supports(profile: VAProfile::Type, width: u32, height: u32) -> boo
         && within(VAConfigAttribType::VAConfigAttribMaxPictureHeight, height)
 }
 
-/// The shared display, so the encoder can open its own config on it.
+/// 获取支持 H.264 的设备，供硬件编码测试创建自己的配置。
 #[cfg(test)]
 pub(super) fn display_handle() -> Result<Rc<Display>, crate::media::decode_api::DecodeError> {
-    display()
+    decode_display(VAProfile::VAProfileH264High, 0, 0)
 }
 
 /// Whether the driver offers an H.264 encode entrypoint.
@@ -228,7 +232,7 @@ impl Pool {
         height: u32,
         count: usize,
     ) -> Result<Self, DecodeError> {
-        let display = display()?;
+        let display = decode_display(profile, width, height)?;
         let config = display
             .create_config(
                 vec![VAConfigAttrib {

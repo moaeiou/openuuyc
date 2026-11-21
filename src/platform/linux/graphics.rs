@@ -407,38 +407,23 @@ impl UiPresenter {
             }
             self.renderer.render(&mut pass, &jobs, &descriptor);
         }
-        let submission = self
-            .queue
+        self.queue
             .submit(user_buffers.into_iter().chain(Some(encoder.finish())));
-        // Freeing after submit keeps a texture alive while the frame still uses it.
+        if self.placement.is_some()
+            && let Some(lease) = self.video.dmabuf_lease()
+        {
+            // 换帧可以立即继续。直到 GPU 采样完成，解码器才能复用这个表面。
+            self.queue.on_submitted_work_done(move || drop(lease));
+        }
+        // 提交后再释放纹理，确保本次绘制期间仍可使用。
         for id in &output.textures_delta.free {
             self.renderer.free_texture(id);
         }
-        // Every delta has been handed to the renderer; epaint asserts on drop
-        // if any is still pending.
+        // 所有纹理更新都已交给渲染器，清空后才能安全销毁输出。
         output.textures_delta.clear();
         self.queue.present(frame);
-        // Nothing else reclaims what a finished submission held. Each frame's
-        // `write_texture` takes a staging buffer from the device, and neither
-        // submitting nor presenting hands it back -- only maintaining the device
-        // does. Without this the buffers pile up at the video bitrate, a few
-        // hundred megabytes a second, until an upload fails with out of memory.
-        //
-        // When the picture aliases a decoder surface the wait must be real:
-        // the next upload drops the lease and frees that surface for decoding,
-        // which would overwrite it while the GPU is still sampling. Blocking
-        // here costs the tail of one frame and removes that race. The wait is
-        // bounded: a hung or lost device must not freeze the UI thread, and
-        // the worst a late frame can cost is one torn picture.
-        let poll = if self.video.holds_dmabuf() {
-            wgpu::PollType::Wait {
-                submission_index: Some(submission),
-                timeout: Some(std::time::Duration::from_millis(250)),
-            }
-        } else {
-            wgpu::PollType::Poll
-        };
-        if let Err(error) = self.device.poll(poll) {
+        // 回收已完成的纹理上传缓冲区，并派发 GPU 提交完成回调。
+        if let Err(error) = self.device.poll(wgpu::PollType::Poll) {
             tracing::debug!(?error, "维护 GPU 设备失败");
         }
         Ok(UiFrame::Presented)
